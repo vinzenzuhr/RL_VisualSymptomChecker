@@ -3,7 +3,7 @@
 
 # ## Reinforcement Learning Project
 
-# In[152]:
+# In[340]:
 
 
 import numpy as np
@@ -31,17 +31,20 @@ from torch.nn.functional import softmax
 import time
 import concurrent.futures
 from threading import Lock
+from torch.utils.tensorboard import SummaryWriter
 
 
 # ### Prepare dataset
 
-# In[153]:
+# In[341]:
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Create tensorboard
+summary = SummaryWriter("./Tensorboards/", purge_step=0)
 
 
-# In[154]:
+# In[342]:
 
 
 class DataProcessor:
@@ -112,7 +115,7 @@ data_processor.delete_folders()
 data = data_processor.get_training_data()
 
 
-# In[155]:
+# In[343]:
 
 
 data_labels=[x[1] for x in data]
@@ -120,7 +123,7 @@ SUPPORTED_CONDITIONS = set(data_labels)
 num_classes=len(SUPPORTED_CONDITIONS)
 
 
-# In[156]:
+# In[344]:
 
 
 #split training-test set
@@ -131,7 +134,7 @@ train_label_counts = dict(Counter(train_labels))
 train_weight_samples = [1/train_label_counts[x] for x in train_labels]
 
 
-# In[157]:
+# In[345]:
 
 
 train_sampler = WeightedRandomSampler(train_weight_samples, num_samples=len(train_labels), replacement=True)
@@ -143,7 +146,7 @@ val_dataloader = DataLoader(validation_data, sampler=val_sampler, batch_size=1)
 
 # ### Prepare training environment
 
-# In[158]:
+# In[346]:
 
 
 #CNN Model
@@ -179,7 +182,7 @@ cnn_model.load_state_dict(torch.load("cnn_model.pth", map_location=torch.device(
 cnn_model.eval()
 
 
-# In[159]:
+# In[347]:
 
 
 # RL Environment 
@@ -195,6 +198,8 @@ class Env:
     _symptoms_of_condition: Dict[str, float] # symptoms of the condition which the simulated patient has
     _supported_conditions: list[str]
     _cnn_model: FineTunedAlexNet
+    _num_asked_symptoms: int
+    _punishment_cost: float
     
     def __init__(self,
                  img: torch.tensor, 
@@ -204,6 +209,9 @@ class Env:
         self._supported_conditions= ["pneumonia", "pneumothorax", "lung cancer", "pleural effusion", "cardiomyopathy"]
         self._img = img
         self._cnn_model = cnn_model 
+        self._num_asked_symptoms = 0
+        self._episode_length = 10
+        self._punishment_cost = 0.7
         #if(condition is None): 
         #    condition = random.sample(self._supported_conditions,1)[0]
         self._condition = condition
@@ -294,6 +302,12 @@ class Env:
                     symptom_probabilities[symptom] = prob
                 condition_symptom_probabilities[condition] = symptom_probabilities 
         return condition_symptom_probabilities
+
+    def final_state(self) -> bool:
+        if(self._num_asked_symptoms >= self._episode_length):
+            return True
+        else:
+            return False             
     
     def posterior_of_condition(self, condition: str, useAddition=False) -> float: 
         #TODO: What is the correct likelihood calculation? If we use multiplication as in P(x,y)=P(x)*P(y), the likelihood gets smaller 
@@ -335,7 +349,7 @@ class Env:
         for i in range(len(self._actions)):
             patient_answer = self._current_state[i+len(self._condition_symptom_probabilities.keys())]
             if (patient_answer!=0):
-                punishment+=0.3
+                punishment+=self._punishment_cost
         return self.posterior_of_condition(self._condition, useAddition=True)-punishment
     
     def has_symptom(self, symptom: str) -> bool:
@@ -345,10 +359,16 @@ class Env:
             phi = np.random.uniform()
             return phi <= self._symptoms_of_condition[symptom]
 
-    def step(self, action_idx: int) -> Transition: 
+    def step(self, action_idx: int) -> Transition:
+        
+        if(self.final_state()):
+            return Transition(self._current_state, action_idx, None, 0)
+        
         action = self._actions[action_idx]
         old_state = self._current_state.copy()
         self._current_state[len(self._condition_symptom_probabilities.keys()) + action_idx] = 1 if self.has_symptom(action) else -1
+
+        self._num_asked_symptoms+=1
 
         # only give reward if it's a symptom of the condition
         #if(action in self._symptoms_of_condition):
@@ -360,10 +380,16 @@ class Env:
     def reset(self) -> np.array:
         self._current_state = self._init_state
         return self._current_state
- 
 
 
-# In[160]:
+# In[348]:
+
+
+summary.add_scalar("With Punishments", True, 0)
+summary.add_scalar("With Reward Addition", True, 0)
+
+
+# In[349]:
 
 
 # Experience Replay for RL
@@ -378,7 +404,7 @@ class ReplayMemory():
         return len(self.memory)
 
 
-# In[161]:
+# In[350]:
 
 
 # RL model
@@ -394,7 +420,7 @@ class DQN(nn.Module):
         return self.layer3(x)
 
 
-# In[162]:
+# In[351]:
 
 
 # BATCH_SIZE is the number of transitions sampled form the replay buffer
@@ -407,11 +433,15 @@ class DQN(nn.Module):
 #LR the learning rate of the Adams optimizar
 BATCH_SIZE = 128
 GAMMA = 0.9
+summary.add_scalar("GAMMA", GAMMA, 0)
 EPS_START = 0.9
 EPS_END = 0.05
-EPS_DECAY = 2000
+EPS_DECAY = 1700 #with 2000 epsilon is after 8000 steps at 0.05
+summary.add_scalar("EPS_DECAY", EPS_DECAY, 0)
 TAU = 0.005
+summary.add_scalar("TAU", TAU, 0)
 LR = 1e-5
+summary.add_scalar("LR", LR, 0)
 
 #Get number of actions from dummy env 
 img = Image.open("Slake1.0/imgs/xmlab333/source.jpg").convert('RGB') # TODO: use dummy img
@@ -435,28 +465,32 @@ memory = ReplayMemory(10000)
 steps_done = 0 
 
 
-# In[225]:
+
+# In[352]:
 
 
-def optimize_model(losses, gradient_norms):
+def optimize_model(losses, gradient_norms, it):
     policy_net.train()
     if len(memory) < BATCH_SIZE: 
         return
-    transitions = memory.sample(BATCH_SIZE)
-    transitions = transitions
+    transitions = memory.sample(BATCH_SIZE) 
     #converts batch_array of Transitions to Transition of batch_arrays
     batch = Transition(*zip(*transitions))
 
-    next_state_batch = torch.tensor(batch.next_state).to(device)
+    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), device=device, dtype=torch.bool)
+    non_final_next_states = torch.stack([torch.tensor(s) for s in batch.next_state if s is not None])
+    non_final_next_states = non_final_next_states.to(device)
+    
     state_batch = torch.tensor(batch.state).to(device)
     action_batch = torch.tensor(batch.action).to(device)
     reward_batch = torch.tensor(batch.reward).to(device)
+    
+    pred=policy_net(state_batch)
+    state_action_values = pred[torch.arange(pred.shape[0]), action_batch]
 
-    state_action_values = policy_net(state_batch).gather(1, action_batch[None,:])
-
-    next_state_values = torch.zeros(BATCH_SIZE, device=device)
+    next_state_values = torch.zeros(BATCH_SIZE, device=device, dtype=torch.double)
     with torch.no_grad():
-        next_state_values = target_net(next_state_batch).max(1)[0]
+        next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0]
 
     #TODO: state_action_values grow infinitely
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
@@ -464,12 +498,13 @@ def optimize_model(losses, gradient_norms):
     #print("state_action_values: ", state_action_values)
     #print("action_batch: ", action_batch)
     #print("reward batch: ", reward_batch)
-    #print("state batch[0]: ", state_batch[0])
+    #print("state batch[0]: ", state_batch[0]) 
 
     criterion = nn.SmoothL1Loss()
-    loss = criterion(state_action_values.squeeze(), expected_state_action_values)
+    loss = criterion(state_action_values, expected_state_action_values)
 
     losses.append((loss.detach()).cpu())
+    
 
     parameters = [p for p in policy_net.parameters() if p.grad is not None and p.requires_grad]
     if len(parameters) == 0:
@@ -477,6 +512,11 @@ def optimize_model(losses, gradient_norms):
     else: 
         total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()).cpu() for p in parameters]), 2.0).item()
     gradient_norms.append(total_norm)
+
+    if((it % 100)==0):
+        summary.add_scalar("training loss", loss.cpu().item(), it)
+        summary.add_scalar("gradient norm", total_norm, it)
+        
     
     optimizer.zero_grad()
     loss.backward()
@@ -484,7 +524,7 @@ def optimize_model(losses, gradient_norms):
     optimizer.step()
 
 
-# In[218]:
+# In[353]:
 
 
 def select_action(myEnv, state, epsilon):
@@ -503,157 +543,56 @@ def select_action(myEnv, state, epsilon):
 
 # ### Start with training
 
-
-# In[190]:
-
-
-lock = Lock() 
-def training_episode(img: torch.tensor, condition: str, epsilon: float):
-    myEnv=Env(img, condition, cnn_model)
-    state = myEnv.reset()
-    for _ in range(len_episode):  
-        action_idx = select_action(myEnv, state, epsilon)
-        #print(action_idx)
-        transition = myEnv.step(action_idx)
-        last_reward=transition.reward
-        state = transition.next_state
-        with lock: 
-            rewards.append(transition.reward)
-            memory.push(transition) 
-    with lock:
-        for _ in range(len_episode):  
-            optimize_model(losses, gradient_norms)
-    
-            #Soft update of target network weights
-            target_net_state_dict = target_net.state_dict()
-            policy_net_state_dict = policy_net.state_dict()
-            for key in policy_net_state_dict:
-                target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
-            target_net.load_state_dict(target_net_state_dict) 
-        total_reward_per_episode.append(last_reward) 
-        
+# In[354]:
 
 
-# In[ ]:
+#indicies = {
+#            "cardiomyopathy": 0, # 0 TP
+#            "pneumothorax": 1,
+#            "pneumonia": 2, 
+#            "lung cancer": 3,
+#            "pleural effusion": 4, # 0 TP
+#        }#
+
+#N=0
+#TP=0 
+#for batch in train_dataloader:
+#    condition = batch[1][0]
+#    img = batch[0][0]
+#    
+#    #if(condition!="pleural effusion"):
+#    #    continue
+#    logits=cnn_model(img[None,:].to(device))
+#    probs = softmax(logits.detach())
+#    #print(probs)
+#    #myEnv=Env(img, condition, cnn_model)
+#    #state = myEnv.reset() 
+#    N+=1 
+#    if(np.argmax(probs) == indicies[condition]):
+#        TP+=1
+#print(N)
+#print(TP)
+#print(TP/N)
 
 
-num_epochs = 16000
-len_episode = 10
-i_decay=1
-epsilon = EPS_START
-losses=[]
-gradient_norms=[]
-rewards=[]
-epsilons=[]
-total_reward_per_episode=[]
-
-
-# In[ ]:
-
-
-for _ in tqdm(range(num_epochs)):
-    for batch in train_dataloader:  
-        if epsilon > EPS_END:
-            epsilon = EPS_START * math.exp(-i_decay/EPS_DECAY)
-            i_decay+=1 
-        epsilons.append(epsilon)
-        condition = batch[1][0]
-        img = batch[0][0] 
-        training_episode(img, condition, epsilon)
-        #pool.map(training_episode, (img, condition, epsilon))
-print("complete") 
-
-
-# In[ ]:
-
- 
-
-
-# In[ ]:
-
-
-torch.save(policy_net.state_dict(), 'RL_model.pth')
-
-
-# In[227]:
-
-
-# helper function
-def averagewindow(R, d=1): 
-    n = len(R)
-    t = []
-    y = []
-    for i in range(0,int(n/d)):
-        t.append(np.mean(range(i*d,(i+1)*d)))
-        y.append(np.mean(R[i*d:min(n,(i+1)*d)]))
-    return t,y
-
-
-# In[228]:
-
-
-plt.plot(epsilons)
-plt.savefig('epsilons.png')
-
-
-# In[229]:
-
-
-t,y = averagewindow(losses, d=50)
-plt.plot(t,y)
-plt.title("losses")
-plt.savefig('losses.png')
-
-
-# In[230]:
-
-
-t,y = averagewindow(gradient_norms, d=50)
-plt.plot(t,y)
-plt.title("gradient norms")
-plt.savefig('gradient norms.png')
-
-
-# In[231]:
-
-
-t,y = averagewindow(rewards, d=800)
-plt.plot(t,y)
-plt.title("Rewards")
-plt.savefig('rewards.png')
-
-
-# In[232]:
-
-
-t,y = averagewindow(total_reward_per_episode, d=50)
-plt.plot(t,y)
-plt.title("Total reward per episode")
-
-
-# ### Evaluation
-
-# In[210]:
+# In[355]:
 
 
 def topKAccuracy(k=3):
     policy_net.eval()
-    epsilon = 0
+    epsilon_val = 0
     N_samples=0
     N_correct_samples=0
     for batch in val_dataloader:
         N_samples+=1
         condition = batch[1][0]
-        img = batch[0][0] 
-        print("Condition: ", condition)
+        img = batch[0][0]  
         myEnv=Env(img, condition, cnn_model) 
         state = myEnv.reset()
         # ask patient 10 symptoms
         for _ in range(len_episode):
-            action_idx = select_action(myEnv, state, epsilon)
-            print("Action: ", myEnv._actions[action_idx])
-            transition = myEnv.step(action_idx)
-            print("Reward: ", transition.reward)
+            action_idx = select_action(myEnv, state, epsilon_val) 
+            transition = myEnv.step(action_idx) 
             state = transition.next_state
         #calculate posterior for every conditions
         posterior_of_conditions = []
@@ -670,14 +609,146 @@ def topKAccuracy(k=3):
         rank = 1+next(i for i, val in enumerate(posterior_of_conditions)
                                   if val[1] == condition)
         if(rank <= k):
-            N_correct_samples+=1 
-        print(posterior_of_conditions) 
+            N_correct_samples+=1  
     return N_correct_samples / N_samples
 
 
-# In[211]:
+# In[356]:
+
+
+def training_episode(img: torch.tensor, condition: str, epsilon: float, it: int):
+    myEnv=Env(img, condition, cnn_model)
+    state = myEnv.reset()
+    #print("new condition: ", condition) 
+    total_reward=0
+    for _ in range(len_episode):  
+        action_idx = select_action(myEnv, state, epsilon)
+        #print(action_idx)
+        transition = myEnv.step(action_idx)
+        #last_reward=transition.reward
+        total_reward+=transition.reward
+        state = transition.next_state
+        #print(transition) 
+        rewards.append(transition.reward)
+        memory.push(transition)
+    if((it % 100)==0):
+        summary.add_scalar("Total Reward", total_reward, it) 
+        summary.add_scalar("epsilon", epsilon, it) 
+    for _ in range(len_episode):  
+        optimize_model(losses, gradient_norms, it)
+
+        #Soft update of target network weights
+        target_net_state_dict = target_net.state_dict()
+        policy_net_state_dict = policy_net.state_dict()
+        for key in policy_net_state_dict:
+            target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+        target_net.load_state_dict(target_net_state_dict) 
+    #total_reward_per_episode.append(last_reward) 
+        
+
+
+# In[357]:
+
+
+num_epochs = 10000 #13000#
+summary.add_scalar("num_epochs", num_epochs, 0)
+len_episode = 11
+summary.add_scalar("len_episode", len_episode, 0)
+i_decay=1
+epsilon = EPS_START
+losses=[]
+gradient_norms=[]
+rewards=[]
+epsilons=[]
+total_reward_per_episode=[]
+
+
+# In[358]:
+
+
+it=0
+for _ in tqdm(range(num_epochs)):
+    for batch in train_dataloader:
+        it+=1
+        if epsilon > EPS_END:
+            epsilon = EPS_START * math.exp(-i_decay/EPS_DECAY)
+            i_decay+=1 
+        epsilons.append(epsilon)
+        condition = batch[1][0]
+        img = batch[0][0] 
+        training_episode(img, condition, epsilon, it)
+        #pool.map(training_episode, (img, condition, epsilon))
+    summary.add_scalar("topKAccuracy", topKAccuracy(k=1), it) 
+pool.shutdown(wait=True)
+print("complete") 
+
+
+# In[ ]:
+
+
+torch.save(policy_net.state_dict(), 'RL_model.pth')
+
+
+# In[361]:
+
+
+# helper function
+def averagewindow(R, d=1):
+    n = len(R)
+    t = []
+    y = []
+    for i in range(0,int(n/d)):
+        t.append(np.mean(range(i*d,(i+1)*d)))
+        y.append(np.mean(R[i*d:min(n,(i+1)*d)]))
+    return t,y
+
+
+# In[362]:
+
+
+plt.plot(epsilons)
+#plt.savefig('epsilons.png')
+
+
+# In[363]:
+
+
+t,y = averagewindow(losses, d=50)
+plt.plot(t,y)
+plt.title("losses")
+#plt.savefig('losses.png')
+
+
+# In[364]:
+
+
+t,y = averagewindow(gradient_norms, d=50)
+plt.plot(t,y)
+plt.title("gradient norms")
+#plt.savefig('gradient norms.png')
+
+
+# In[365]:
+
+
+t,y = averagewindow(rewards, d=800)
+plt.plot(t,y)
+plt.title("Rewards")
+#plt.savefig('rewards.png')
+
+
+# In[366]:
+
+
+t,y = averagewindow(total_reward_per_episode, d=50)
+plt.plot(t,y)
+plt.title("Total reward per episode")
+#plt.savefig('total reward per episode.png')
+
+
+# ### Evaluation
+
+# In[370]:
 
 
 print(topKAccuracy(k=3)) #Random model would have 0.6
-
-
