@@ -3,7 +3,7 @@
 
 # ## Reinforcement Learning Project
 
-# In[340]:
+# In[1]:
 
 
 import numpy as np
@@ -34,9 +34,9 @@ from threading import Lock
 from torch.utils.tensorboard import SummaryWriter
 
 
-# ### Prepare dataset
+# ### Define RL Env 
 
-# In[341]:
+# In[2]:
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,109 +44,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 summary = SummaryWriter("./Tensorboards/", purge_step=0)
 
 
-# In[342]:
-
-
-class DataProcessor:
-    def __init__(self, folder_path, disease_list):
-        self.folder_path = folder_path
-        self.disease_list = disease_list
-        self.folders_with_diseases_labels = {}
-        self.folder_name_with_diseases = []
-        self.label_counts = None
-
-    def read_data(self):
-        for root, dirs, files in os.walk(os.path.join(self.folder_path, 'imgs')):
-            for folder_name in dirs:
-                folder_path = os.path.join(root, folder_name)
-                
-                detection_file_path = os.path.join(folder_path, 'detection.json')
-                with open(detection_file_path, 'r') as detection_file:
-                    detection_data = json.load(detection_file)
-
-                    disease_labels = [label.lower() for item in detection_data for label in item.keys() if label in self.disease_list]
-                    
-                    for idx, label in enumerate(disease_labels):
-                        if label == "effusion":
-                            disease_labels[idx] = "pleural effusion" 
-                        elif label == "cardiomegaly":
-                            disease_labels[idx] = "cardiomyopathy"
-                             
-                    disease_labels = set(disease_labels) 
-                    
-                    # merge labels for images with multiple labels
-                    if disease_labels:
-                        merged_label = '-'.join(sorted(disease_labels))
-                        self.folders_with_diseases_labels[folder_name] = merged_label
-                        self.folder_name_with_diseases.append(folder_name)
-
-    def delete_folders(self):
-        # frequency of each merged label
-        self.label_counts = Counter(self.folders_with_diseases_labels.values())
-
-        # delete folders with label counts <= 3
-        folders_to_delete = [folder_name for folder_name, label in self.folders_with_diseases_labels.items() if self.label_counts[label] <= 3]
-
-        for folder_name in folders_to_delete:
-            del self.folders_with_diseases_labels[folder_name]
-            self.folder_name_with_diseases.remove(folder_name)
-            
-    def get_training_data(self):
-        training_data = []
-        for folder_name, label in self.folders_with_diseases_labels.items():
-            folder_path = os.path.join(self.folder_path, 'imgs', folder_name)
-            image_path = os.path.join(folder_path, 'source.jpg') 
-            img = Image.open(image_path).convert('RGB')
-            transform = transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            img = transform(img)
-            training_data.append((img, label))
-        return training_data
-
-
-folder_path = 'Slake1.0'
-disease_list = ['Pneumothorax', 'Pneumonia', 'Effusion', 'Lung Cancer', "Cardiomegaly"]
-data_processor = DataProcessor(folder_path, disease_list)
-data_processor.read_data()
-data_processor.delete_folders()
-data = data_processor.get_training_data()
-
-
-# In[343]:
-
-
-data_labels=[x[1] for x in data]
-SUPPORTED_CONDITIONS = set(data_labels) 
-num_classes=len(SUPPORTED_CONDITIONS)
-
-
-# In[344]:
-
-
-#split training-test set
-training_data, validation_data = train_test_split(data, test_size=0.2, random_state=42, shuffle = True, stratify=np.array(data_labels))
-
-train_labels = [x[1] for x in training_data]
-train_label_counts = dict(Counter(train_labels))
-train_weight_samples = [1/train_label_counts[x] for x in train_labels]
-
-
-# In[345]:
-
-
-train_sampler = WeightedRandomSampler(train_weight_samples, num_samples=len(train_labels), replacement=True)
-train_dataloader = DataLoader(training_data, sampler=train_sampler, batch_size=1)
-
-val_sampler = SequentialSampler(validation_data)
-val_dataloader = DataLoader(validation_data, sampler=val_sampler, batch_size=1)
-
-
-# ### Prepare training environment
-
-# In[346]:
+# In[3]:
 
 
 #CNN Model
@@ -177,12 +75,13 @@ class FineTunedAlexNet(nn.Module):
         x = self.fc(x)
         return x
 
+num_classes = 5
 cnn_model = FineTunedAlexNet(num_classes=num_classes).to(device)
 cnn_model.load_state_dict(torch.load("cnn_model.pth", map_location=torch.device(device)))
 cnn_model.eval()
 
 
-# In[347]:
+# In[4]:
 
 
 # RL Environment 
@@ -204,7 +103,8 @@ class Env:
     def __init__(self,
                  img: torch.tensor, 
                  condition: str,
-                 cnn_model: FineTunedAlexNet
+                 cnn_model: FineTunedAlexNet,
+                 visual_prior_train: torch.tensor = None
                 ) -> None:  
         self._supported_conditions= ["pneumonia", "pneumothorax", "lung cancer", "pleural effusion", "cardiomyopathy"]
         self._img = img
@@ -252,28 +152,30 @@ class Env:
 
         
         #compute visual prior
-        logits = self._cnn_model(img[None,:].to(device))[0]
-        logits = logits.cpu()
-        #sort logits to the same order as in self._condition_symptom_probabilities. CNN_model output: Lung Cancer: idx 0, Pneumothorax: idx 1, Pneumonia: idx 2, Effusion: idx 3, Cardiomegaly: idx 4 
-        #logit_indicies = {
-        #    "lung cancer": 0,
-        #    "pneumothorax": 1, 
-        #    "pneumonia": 2, 
-        #    "pleural effusion": 3, 
-        #    "cardiomyopathy": 4
-        #}  
-        logit_indicies = {
-            "cardiomyopathy": 0,
-            "pneumothorax": 1,
-            "pneumonia": 2, 
-            "lung cancer": 3,
-            "pleural effusion": 4, 
-        }
-        condition_logit_idx = [logit_indicies[c] for c in self._condition_symptom_probabilities.keys()]
-        visual_prior = softmax(torch.tensor([logits[idx] for idx in condition_logit_idx]))
-        
-        #visual_prior = np.ones(shape=(len(self._condition_symptom_probabilities.keys()))) #TODO: replace with cnn output 
-        # init init_state = vector with cnn output (probabilities per condition) and history of asked symptoms (0=not asked, 1=symptom is present, -1=symptom is not present)
+        if(visual_prior_train is not None):
+            visual_prior=visual_prior_train
+        else:
+            logits = self._cnn_model(img[None,:].to(device))[0]
+            logits = logits.cpu()
+            #sort logits to the same order as in self._condition_symptom_probabilities. CNN_model output: Lung Cancer: idx 0, Pneumothorax: idx 1, Pneumonia: idx 2, Effusion: idx 3, Cardiomegaly: idx 4 
+            #logit_indicies = {
+            #    "lung cancer": 0,
+            #    "pneumothorax": 1, 
+            #    "pneumonia": 2, 
+            #    "pleural effusion": 3, 
+            #    "cardiomyopathy": 4
+            #}  
+            logit_indicies = {
+                "cardiomyopathy": 0,
+                "pneumothorax": 1,
+                "pneumonia": 2, 
+                "lung cancer": 3,
+                "pleural effusion": 4, 
+            }
+            condition_logit_idx = [logit_indicies[c] for c in self._condition_symptom_probabilities.keys()]
+            visual_prior = softmax(torch.tensor([logits[idx] for idx in condition_logit_idx])) 
+            #visual_prior = np.ones(shape=(len(self._condition_symptom_probabilities.keys()))) #TODO: replace with cnn output 
+            # init init_state = vector with cnn output (probabilities per condition) and history of asked symptoms (0=not asked, 1=symptom is present, -1=symptom is not present)
         self._init_state = np.concatenate((visual_prior,np.zeros((len(self._actions)))), axis=0)
         self._current_state = self._init_state
 
@@ -380,16 +282,143 @@ class Env:
     def reset(self) -> np.array:
         self._current_state = self._init_state
         return self._current_state
+myEnv=Env([], 'pneumonia', cnn_model, np.zeros(num_classes))
 
 
-# In[348]:
+# In[5]:
 
 
 summary.add_scalar("With Punishments", True, 0)
 summary.add_scalar("With Reward Addition", True, 0)
 
 
-# In[349]:
+# ### Prepare dataset
+
+# In[6]:
+
+
+class DataProcessor:
+    def __init__(self, folder_path, disease_list):
+        self.folder_path = folder_path
+        self.disease_list = disease_list
+        self.folders_with_diseases_labels = {}
+        self.folder_name_with_diseases = []
+        self.label_counts = None
+        
+    def read_data(self):
+        for root, dirs, files in os.walk(os.path.join(self.folder_path, 'imgs')):
+            for folder_name in dirs:
+                folder_path = os.path.join(root, folder_name)
+                
+                detection_file_path = os.path.join(folder_path, 'detection.json')
+                with open(detection_file_path, 'r') as detection_file:
+                    detection_data = json.load(detection_file)
+
+                    disease_labels = [label.lower() for item in detection_data for label in item.keys() if label in self.disease_list]
+                    
+                    for idx, label in enumerate(disease_labels):
+                        if label == "effusion":
+                            disease_labels[idx] = "pleural effusion" 
+                        elif label == "cardiomegaly":
+                            disease_labels[idx] = "cardiomyopathy"
+                             
+                    disease_labels = set(disease_labels) 
+                    
+                    # merge labels for images with multiple labels
+                    if disease_labels:
+                        merged_label = '-'.join(sorted(disease_labels))
+                        self.folders_with_diseases_labels[folder_name] = merged_label
+                        self.folder_name_with_diseases.append(folder_name)
+
+    def delete_folders(self):
+        # frequency of each merged label
+        self.label_counts = Counter(self.folders_with_diseases_labels.values())
+
+        # delete folders with label counts <= 3
+        folders_to_delete = [folder_name for folder_name, label in self.folders_with_diseases_labels.items() if self.label_counts[label] <= 3]
+
+        for folder_name in folders_to_delete:
+            del self.folders_with_diseases_labels[folder_name]
+            self.folder_name_with_diseases.remove(folder_name)
+            
+    def get_training_data(self):
+        training_data = []
+        for folder_name, label in self.folders_with_diseases_labels.items():
+            folder_path = os.path.join(self.folder_path, 'imgs', folder_name)
+            image_path = os.path.join(folder_path, 'source.jpg') 
+            img = Image.open(image_path).convert('RGB')
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            img = transform(img)
+
+            logits = cnn_model(img[None,:].to(device))[0]
+            logits = logits.cpu()
+            #sort logits to the same order as in self._condition_symptom_probabilities. CNN_model output: Lung Cancer: idx 0, Pneumothorax: idx 1, Pneumonia: idx 2, Effusion: idx 3, Cardiomegaly: idx 4 
+            #logit_indicies = {
+            #    "lung cancer": 0,
+            #    "pneumothorax": 1, 
+            #    "pneumonia": 2, 
+            #    "pleural effusion": 3, 
+            #    "cardiomyopathy": 4
+            #}  
+            logit_indicies = {
+                "cardiomyopathy": 0,
+                "pneumothorax": 1,
+                "pneumonia": 2, 
+                "lung cancer": 3,
+                "pleural effusion": 4, 
+            }
+            condition_logit_idx = [logit_indicies[c] for c in myEnv._condition_symptom_probabilities.keys()]
+            visual_prior = softmax(torch.tensor([logits[idx] for idx in condition_logit_idx]))
+            
+            training_data.append((img, label, visual_prior))
+        return training_data
+
+
+folder_path = 'Slake1.0'
+disease_list = ['Pneumothorax', 'Pneumonia', 'Effusion', 'Lung Cancer', "Cardiomegaly"]
+data_processor = DataProcessor(folder_path, disease_list)
+data_processor.read_data()
+data_processor.delete_folders()
+data = data_processor.get_training_data()
+
+
+# In[8]:
+
+
+data_labels=[x[1] for x in data]
+SUPPORTED_CONDITIONS = set(data_labels) 
+if(num_classes!=len(SUPPORTED_CONDITIONS)):
+    raise ValueError("num_classes is wrongly initialized")
+
+
+# In[9]:
+
+
+#split training-test set
+training_data, validation_data = train_test_split(data, test_size=0.2, random_state=42, shuffle = True, stratify=np.array(data_labels))
+
+train_labels = [x[1] for x in training_data]
+train_label_counts = dict(Counter(train_labels))
+train_weight_samples = [1/train_label_counts[x] for x in train_labels]
+
+
+# In[10]:
+
+
+train_sampler = WeightedRandomSampler(train_weight_samples, num_samples=len(train_labels), replacement=True)
+train_dataloader = DataLoader(training_data, sampler=train_sampler, batch_size=1)
+
+val_sampler = SequentialSampler(validation_data)
+val_dataloader = DataLoader(validation_data, sampler=val_sampler, batch_size=1)
+
+
+# ### Prepare training environment
+
+# In[11]:
 
 
 # Experience Replay for RL
@@ -404,7 +433,7 @@ class ReplayMemory():
         return len(self.memory)
 
 
-# In[350]:
+# In[12]:
 
 
 # RL model
@@ -420,7 +449,27 @@ class DQN(nn.Module):
         return self.layer3(x)
 
 
-# In[351]:
+# In[13]:
+
+
+#helper function to calculcate eps_decay
+def eps_decay_cal(EPS_DECAY_2, num_epoch):
+    i_decay_2=0
+    epsilon_2=EPS_START
+    for _ in range(num_epoch):
+        if epsilon_2 > EPS_END:
+            epsilon_2 = EPS_START * math.exp(-i_decay_2/EPS_DECAY_2)
+            i_decay_2+=1 
+    return epsilon_2
+
+
+# In[14]:
+
+
+#eps_decay_cal(1700, 1000)
+
+
+# In[15]:
 
 
 # BATCH_SIZE is the number of transitions sampled form the replay buffer
@@ -435,23 +484,15 @@ BATCH_SIZE = 128
 GAMMA = 0.9
 summary.add_scalar("GAMMA", GAMMA, 0)
 EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 1700 #with 2000 epsilon is after 8000 steps at 0.05
+EPS_END = 0.1 
+summary.add_scalar("EPS_END", EPS_END, 0)
+EPS_DECAY = 1700#2000 #with 2000 epsilon is after 6000 steps at 0.05
 summary.add_scalar("EPS_DECAY", EPS_DECAY, 0)
 TAU = 0.005
 summary.add_scalar("TAU", TAU, 0)
 LR = 1e-5
 summary.add_scalar("LR", LR, 0)
 
-#Get number of actions from dummy env 
-img = Image.open("Slake1.0/imgs/xmlab333/source.jpg").convert('RGB') # TODO: use dummy img
-transform = transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-img = transform(img) 
-myEnv=Env(img, 'pneumonia', cnn_model) 
 n_actions = len(myEnv._actions)
 n_observations = len(myEnv._current_state)
 
@@ -465,8 +506,7 @@ memory = ReplayMemory(10000)
 steps_done = 0 
 
 
-
-# In[352]:
+# In[16]:
 
 
 def optimize_model(losses, gradient_norms, it):
@@ -484,7 +524,7 @@ def optimize_model(losses, gradient_norms, it):
     state_batch = torch.tensor(batch.state).to(device)
     action_batch = torch.tensor(batch.action).to(device)
     reward_batch = torch.tensor(batch.reward).to(device)
-    
+
     pred=policy_net(state_batch)
     state_action_values = pred[torch.arange(pred.shape[0]), action_batch]
 
@@ -524,7 +564,7 @@ def optimize_model(losses, gradient_norms, it):
     optimizer.step()
 
 
-# In[353]:
+# In[17]:
 
 
 def select_action(myEnv, state, epsilon):
@@ -541,9 +581,85 @@ def select_action(myEnv, state, epsilon):
     return action_idx
 
 
+# In[18]:
+
+
+def topKAccuracy(k=3):
+    selected_actions=set()
+    policy_net.eval()
+    epsilon_val = 0
+    N_samples=0
+    N_correct_samples=0
+    for batch in val_dataloader:
+        N_samples+=1
+        condition = batch[1][0]
+        img = batch[0][0]  
+        visual_prior = batch[2][0]
+        myEnv=Env(img, condition, cnn_model, visual_prior)
+        state = myEnv.reset()
+        # ask patient 10 symptoms
+        for _ in range(len_episode):
+            action_idx = select_action(myEnv, state, epsilon_val)
+            transition = myEnv.step(action_idx)
+            state = transition.next_state
+            if(action_idx not in selected_actions):
+                selected_actions.add(action_idx)
+        #calculate posterior for every conditions
+        posterior_of_conditions = []
+        for condition in myEnv._supported_conditions:
+            posterior = myEnv.posterior_of_condition(condition, useAddition=False)
+            #set posterior to 0 if no symptom is related to the condition and therefore the likelihood stays
+            #TODO: Delete when cnn is integrated
+            if(posterior==1):
+                posterior=0
+            posterior_of_conditions.append((posterior, condition))
+        #sort posteriors by value
+        posterior_of_conditions.sort(key=lambda x: x[0])
+        #get rank of posterior of correct condition
+        rank = 1+next(i for i, val in enumerate(posterior_of_conditions)
+                                  if val[1] == condition)
+        if(rank <= k):
+            N_correct_samples+=1  
+    return N_correct_samples / N_samples, selected_actions
+
+
+# In[19]:
+
+
+def training_episode(img: torch.tensor, condition: str, epsilon: float, it: int, visual_prior: torch.tensor = None):
+    myEnv=Env(img, condition, cnn_model, visual_prior)
+    state = myEnv.reset()
+    #print("new condition: ", condition) 
+    total_reward=0
+    for _ in range(len_episode):  
+        action_idx = select_action(myEnv, state, epsilon)
+        #print(action_idx)
+        transition = myEnv.step(action_idx)
+        #last_reward=transition.reward
+        total_reward+=transition.reward
+        state = transition.next_state
+        #print(transition) 
+        rewards.append(transition.reward)
+        memory.push(transition)
+    if((it % 100)==0):
+        summary.add_scalar("Total Reward", total_reward, it) 
+        summary.add_scalar("epsilon", epsilon, it) 
+    for _ in range(len_episode):  
+        optimize_model(losses, gradient_norms, it)
+
+        #Soft update of target network weights
+        target_net_state_dict = target_net.state_dict()
+        policy_net_state_dict = policy_net.state_dict()
+        for key in policy_net_state_dict:
+            target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+        target_net.load_state_dict(target_net_state_dict) 
+    #total_reward_per_episode.append(last_reward) 
+        
+
+
 # ### Start with training
 
-# In[354]:
+# In[20]:
 
 
 #indicies = {
@@ -575,84 +691,12 @@ def select_action(myEnv, state, epsilon):
 #print(TP/N)
 
 
-# In[355]:
+# In[21]:
 
 
-def topKAccuracy(k=3):
-    policy_net.eval()
-    epsilon_val = 0
-    N_samples=0
-    N_correct_samples=0
-    for batch in val_dataloader:
-        N_samples+=1
-        condition = batch[1][0]
-        img = batch[0][0]  
-        myEnv=Env(img, condition, cnn_model) 
-        state = myEnv.reset()
-        # ask patient 10 symptoms
-        for _ in range(len_episode):
-            action_idx = select_action(myEnv, state, epsilon_val) 
-            transition = myEnv.step(action_idx) 
-            state = transition.next_state
-        #calculate posterior for every conditions
-        posterior_of_conditions = []
-        for condition in myEnv._supported_conditions:
-            posterior = myEnv.posterior_of_condition(condition, useAddition=False)
-            #set posterior to 0 if no symptom is related to the condition and therefore the likelihood stays
-            #TODO: Delete when cnn is integrated
-            if(posterior==1):
-                posterior=0
-            posterior_of_conditions.append((posterior, condition))
-        #sort posteriors by value
-        posterior_of_conditions.sort(key=lambda x: x[0])
-        #get rank of posterior of correct condition
-        rank = 1+next(i for i, val in enumerate(posterior_of_conditions)
-                                  if val[1] == condition)
-        if(rank <= k):
-            N_correct_samples+=1  
-    return N_correct_samples / N_samples
-
-
-# In[356]:
-
-
-def training_episode(img: torch.tensor, condition: str, epsilon: float, it: int):
-    myEnv=Env(img, condition, cnn_model)
-    state = myEnv.reset()
-    #print("new condition: ", condition) 
-    total_reward=0
-    for _ in range(len_episode):  
-        action_idx = select_action(myEnv, state, epsilon)
-        #print(action_idx)
-        transition = myEnv.step(action_idx)
-        #last_reward=transition.reward
-        total_reward+=transition.reward
-        state = transition.next_state
-        #print(transition) 
-        rewards.append(transition.reward)
-        memory.push(transition)
-    if((it % 100)==0):
-        summary.add_scalar("Total Reward", total_reward, it) 
-        summary.add_scalar("epsilon", epsilon, it) 
-    for _ in range(len_episode):  
-        optimize_model(losses, gradient_norms, it)
-
-        #Soft update of target network weights
-        target_net_state_dict = target_net.state_dict()
-        policy_net_state_dict = policy_net.state_dict()
-        for key in policy_net_state_dict:
-            target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
-        target_net.load_state_dict(target_net_state_dict) 
-    #total_reward_per_episode.append(last_reward) 
-        
-
-
-# In[357]:
-
-
-num_epochs = 10000 #13000#
+num_epochs = 10000#1300#1600#2500
 summary.add_scalar("num_epochs", num_epochs, 0)
-len_episode = 11
+len_episode = 10
 summary.add_scalar("len_episode", len_episode, 0)
 i_decay=1
 epsilon = EPS_START
@@ -663,23 +707,25 @@ epsilons=[]
 total_reward_per_episode=[]
 
 
-# In[358]:
+# In[ ]:
 
 
 it=0
 for _ in tqdm(range(num_epochs)):
+    it+=1
+    if epsilon > EPS_END:
+        epsilon = EPS_START * math.exp(-i_decay/EPS_DECAY)
+        i_decay+=1 
+    epsilons.append(epsilon)
     for batch in train_dataloader:
-        it+=1
-        if epsilon > EPS_END:
-            epsilon = EPS_START * math.exp(-i_decay/EPS_DECAY)
-            i_decay+=1 
-        epsilons.append(epsilon)
         condition = batch[1][0]
         img = batch[0][0] 
-        training_episode(img, condition, epsilon, it)
+        visual_prior = batch[2][0]  
+        training_episode(img, condition, epsilon, it, visual_prior)  
         #pool.map(training_episode, (img, condition, epsilon))
-    summary.add_scalar("topKAccuracy", topKAccuracy(k=1), it) 
-pool.shutdown(wait=True)
+    acc, selected_actions = topKAccuracy(k=1)
+    summary.add_scalar("topKAccuracy", acc, it)
+    summary.add_scalar("num_selected_actions", len(selected_actions), it) 
 print("complete") 
 
 
@@ -689,7 +735,7 @@ print("complete")
 torch.save(policy_net.state_dict(), 'RL_model.pth')
 
 
-# In[361]:
+# In[ ]:
 
 
 # helper function
@@ -703,14 +749,14 @@ def averagewindow(R, d=1):
     return t,y
 
 
-# In[362]:
+# In[ ]:
 
 
 plt.plot(epsilons)
 #plt.savefig('epsilons.png')
 
 
-# In[363]:
+# In[ ]:
 
 
 t,y = averagewindow(losses, d=50)
@@ -719,7 +765,7 @@ plt.title("losses")
 #plt.savefig('losses.png')
 
 
-# In[364]:
+# In[ ]:
 
 
 t,y = averagewindow(gradient_norms, d=50)
@@ -728,7 +774,7 @@ plt.title("gradient norms")
 #plt.savefig('gradient norms.png')
 
 
-# In[365]:
+# In[ ]:
 
 
 t,y = averagewindow(rewards, d=800)
@@ -737,7 +783,7 @@ plt.title("Rewards")
 #plt.savefig('rewards.png')
 
 
-# In[366]:
+# In[ ]:
 
 
 t,y = averagewindow(total_reward_per_episode, d=50)
@@ -748,7 +794,9 @@ plt.title("Total reward per episode")
 
 # ### Evaluation
 
-# In[370]:
+# In[ ]:
 
 
-print(topKAccuracy(k=3)) #Random model would have 0.6
+acc, selected_actions = topKAccuracy(k=3)
+print(acc) #Random model would have 0.6
+ 
