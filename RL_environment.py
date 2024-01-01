@@ -416,7 +416,7 @@ val_dataloader = DataLoader(validation_data, sampler=val_sampler, batch_size=1)
 
 # ### Prepare training environment
 
-# In[57]:
+# In[148]:
 
 
 # Experience Replay for RL
@@ -431,23 +431,29 @@ class ReplayMemory():
         return len(self.memory)
 
 
-# In[58]:
+# In[235]:
 
 
 # RL model
+def init_bias(lin_layer, bias):
+    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(lin_layer.weight)
+    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+    nn.init.uniform_(lin_layer.bias, bias-bound, bias+bound) 
+
 class DQN(nn.Module):
     def __init__(self, n_observations, n_actions):
         super(DQN, self).__init__()
-        self.layer1 = nn.Linear(n_observations, 128, dtype=torch.double)
-        self.layer2 = nn.Linear(128, 128, dtype=torch.double)
+        self.layer1 = nn.Linear(n_observations, 128, dtype=torch.double) 
+        self.layer2 = nn.Linear(128, 128, dtype=torch.double) 
         self.layer3 = nn.Linear(128, n_actions, dtype=torch.double)
+        init_bias(self.layer3, 20)  # add +30 to output
     def forward(self, x):
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
         return self.layer3(x)
 
 
-# In[59]:
+# In[150]:
 
 
 #helper function to calculcate eps_decay
@@ -461,13 +467,13 @@ def eps_decay_cal(EPS_DECAY_2, num_epoch):
     return epsilon_2
 
 
-# In[60]:
+# In[151]:
 
 
-#eps_decay_cal(1700, 1000)
+#eps_decay_cal(2000, 6000)
 
 
-# In[61]:
+# In[236]:
 
 
 # BATCH_SIZE is the number of transitions sampled form the replay buffer
@@ -481,10 +487,10 @@ def eps_decay_cal(EPS_DECAY_2, num_epoch):
 BATCH_SIZE = 128
 GAMMA = 0.9
 summary.add_scalar("GAMMA", GAMMA, 0)
-EPS_START = 0.9
-EPS_END = 0.01 
+EPS_START = 0
+EPS_END = 0
 summary.add_scalar("EPS_END", EPS_END, 0)
-EPS_DECAY = 2500#2000 #with 2000 epsilon is after 6000 steps at 0.05
+EPS_DECAY = 200 #with 2000 epsilon is after 6000 steps at 0.05
 summary.add_scalar("EPS_DECAY", EPS_DECAY, 0)
 TAU = 0.005
 summary.add_scalar("TAU", TAU, 0)
@@ -504,7 +510,7 @@ memory = ReplayMemory(10000)
 steps_done = 0 
 
 
-# In[62]:
+# In[153]:
 
 
 def optimize_model(losses, gradient_norms, it):
@@ -565,7 +571,7 @@ def optimize_model(losses, gradient_norms, it):
     optimizer.step()
 
 
-# In[63]:
+# In[154]:
 
 
 def select_action(myEnv, state, epsilon):
@@ -574,7 +580,7 @@ def select_action(myEnv, state, epsilon):
         action_idx = np.random.randint(len(myEnv._actions))
         #print("random")
     else:  
-        with torch.no_grad():
+        with torch.no_grad(): 
             action_idx = np.argmax(policy_net(torch.tensor(state).to(device)).cpu()).item()
             #print("state: ", state)
             #print("action_idx: ", action_idx)
@@ -585,7 +591,7 @@ def select_action(myEnv, state, epsilon):
     return action_idx
 
 
-# In[64]:
+# In[155]:
 
 
 def topKAccuracy(k=3):
@@ -643,7 +649,7 @@ def topKAccuracy(k=3):
     return acc, conf_matrix, selected_actions
 
 
-# In[65]:
+# In[156]:
 
 
 def training_episode(img: torch.tensor, condition: str, epsilon: float, it: int, visual_prior: torch.tensor = None):
@@ -681,10 +687,10 @@ def training_episode(img: torch.tensor, condition: str, epsilon: float, it: int,
 
 # ### Start with training
 
-# In[66]:
+# In[242]:
 
 
-num_epochs = 10000#1300#1600#2500
+num_epochs = 240#1300#1600#2500
 summary.add_scalar("num_epochs", num_epochs, 0)
 len_episode = 10
 summary.add_scalar("len_episode", len_episode, 0)
@@ -698,7 +704,7 @@ total_reward_per_episode=[]
 num_selected_actions=[]
 
 
-# In[67]:
+# In[ ]:
 
 
 it=0
@@ -725,20 +731,20 @@ for _ in tqdm(range(num_epochs)):
 print("complete") 
 
 
-# In[68]:
+# In[ ]:
 
 
 #load trained model from ubelix
 #policy_net.load_state_dict(torch.load("RL_model.pth", map_location=torch.device(device)))
 
 
-# In[69]:
+# In[ ]:
 
 
 torch.save(policy_net.state_dict(), 'RL_model.pth')
 
 
-# In[70]:
+# In[289]:
 
 
 # helper function
@@ -752,14 +758,14 @@ def averagewindow(R, d=1):
     return t,y
 
 
-# In[71]:
+# In[290]:
 
 
 plt.plot(epsilons)
 #plt.savefig('epsilons.png')
 
 
-# In[72]:
+# In[291]:
 
 
 t,y = averagewindow(losses, d=50)
@@ -768,7 +774,7 @@ plt.title("losses")
 #plt.savefig('losses.png')
 
 
-# In[73]:
+# In[292]:
 
 
 t,y = averagewindow(gradient_norms, d=50)
@@ -777,7 +783,7 @@ plt.title("gradient norms")
 #plt.savefig('gradient norms.png')
 
 
-# In[74]:
+# In[293]:
 
 
 t,y = averagewindow(rewards, d=800)
@@ -786,7 +792,7 @@ plt.title("Rewards")
 #plt.savefig('rewards.png')
 
 
-# In[75]:
+# In[294]:
 
 
 t,y = averagewindow(num_selected_actions, d=1)
@@ -797,7 +803,7 @@ plt.title("Number of selected actions during evaluation")
 
 # ### Evaluation
 
-# In[76]:
+# In[295]:
 
 
 acc, conf_matrix, selected_actions = topKAccuracy(k=1)
@@ -808,13 +814,13 @@ print("num selected actions: ", len(selected_actions))
 
 # ### Test cases
 
-# In[77]:
+# In[296]:
 
 
 #policy_net.eval()
 
 
-# In[78]:
+# In[297]:
 
 
 """
@@ -833,7 +839,7 @@ print("\n Probability of spastic cough after 10000 samples: " + str(prob/n))
 """
 
 
-# In[79]:
+# In[298]:
 
 
 """
@@ -863,10 +869,9 @@ print("Reward: " + str(myTestEnv.reward()))
 
 # #### Testing Suite for Q Learning
 
-# In[80]:
+# In[299]:
 
 
-"""
 #pick a sample
 for batch in train_dataloader:
     condition = batch[1][0]
@@ -876,28 +881,27 @@ for batch in train_dataloader:
 print("Condition: ", condition)
 print("Visual Prior: ", visual_prior)
 print("Visual Prior of condition: ", visual_prior[list(myEnv._condition_symptom_probabilities.keys()).index(condition)])
-"""
 
 
-# In[81]:
+# In[300]:
 
 
-"""
 #Init Environement with sample
 myEnv=Env(img, condition, cnn_model, visual_prior)
 state = myEnv.reset()
-"""
 
 
-# In[82]:
+# In[301]:
 
 
-"""
 #go step by step and check the numbers
 print("current state: ", state)
 #print("state-action values: ", policy_net(torch.tensor(state).to(device)))
 action_idx = np.argmax(policy_net(torch.tensor(state)).detach().cpu()).item()
 state_action_value = policy_net(torch.tensor(state).to(device))[action_idx]
+
+print(policy_net(torch.tensor(state).to(device)))
+
 print("Best state-action value: ", state_action_value.item())
 print("Choosen action: ", action_idx, " name: ", myEnv._actions[action_idx])
 transition = myEnv.step(action_idx)
@@ -905,18 +909,21 @@ print("Next state: ", transition.next_state)
 print("Reward next state: ", transition.reward)
 reward=transition.reward
 #print("state-action values next state: ", target_net(torch.tensor(transition.next_state).to(device)))
-best_state_action_next_state=target_net(torch.tensor(transition.next_state[None,:])).max(1)[0]
+if(transition.next_state is None):
+    best_state_action_next_state=target_net(torch.tensor(transition.next_state[None,:])).max(1)[0]
+else:
+    best_state_action_next_state=torch.tensor(0)
 print("Best state-action value of next state: ", best_state_action_next_state.item())
 expected_state_value=((best_state_action_next_state) * GAMMA) + reward
 print("Expected state-action value from current state: ", expected_state_value.item())
+criterion=nn.SmoothL1Loss()
 print("loss: ", criterion(expected_state_value, state_action_value).item())
 state=transition.next_state
-"""
 
 
 # #### Testing accuracy of CNN
 
-# In[83]:
+# In[302]:
 
 
 """
@@ -949,7 +956,7 @@ print("accuracy: ", TP/N)
 """
 
 
-# In[84]:
+# In[85]:
 
 
 #create python script for ubelix
